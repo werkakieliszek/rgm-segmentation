@@ -2,6 +2,7 @@
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
+from scipy import stats as sstats
 
 LIFECYCLE_GAP_WEEKS = 26
 MIN_OBS_FOR_REGRESSION = 8
@@ -9,6 +10,8 @@ MOMENTUM_WINDOW_WEEKS = 12
 MAT_WINDOW_WEEKS = 52
 MIN_MONTHS_FOR_SEASONALITY = 6
 WEEK_ANCHOR = "W-SAT"  # data is Saturday-anchored, not pandas' default Sunday
+PEER_MIN_OVERLAP_WEEKS = 30  # min shared weeks before trusting a pair's correlation
+PEER_ALPHA = 0.05  # significance level, Bonferroni-corrected for all pairs tested at once
 
 
 def _slope(y: np.ndarray) -> float:
@@ -30,8 +33,8 @@ def _fill_gaps(g: pd.DataFrame) -> pd.DataFrame:
 def _clean(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["period_id"] = pd.to_datetime(df["period_id"])
-    #df["any_promo_units"] = df["any_promo_units"].clip(lower=0)
-    #df["any_promo_amt"] = df["any_promo_amt"].clip(lower=0, upper=df["total_sales"])
+    df["any_promo_units"] = df["any_promo_units"].clip(lower=0)
+    df["any_promo_amt"] = df["any_promo_amt"].clip(lower=0, upper=df["total_sales"])
     df["price"] = df["total_sales"] / df["total_units"].replace(0, np.nan)
     df["on_promo"] = (df["any_promo_units"] > 0).astype(int)
     return df
@@ -147,6 +150,87 @@ def _seasonality_index(g: pd.DataFrame) -> float:
     return (month_avg.max() - month_avg.min()) / month_avg.mean()
 
 
+def _residuals_by_retailer(pr_weekly: pd.DataFrame) -> pd.DataFrame:
+    """log-sales residual vs. each ppg-retailer's own non-promo baseline,
+    within each retailer -- a PPG's pattern at one retailer shouldn't be
+    contaminated by a different retailer's promo calendar."""
+    out = pr_weekly.copy()
+    out["log_sales"] = np.log1p(out["sales"])
+    baseline = out.loc[out.on_promo == 0].groupby(["rgm_ppg", "retailer_nm"])["log_sales"].mean()
+    out = out.set_index(["rgm_ppg", "retailer_nm"])
+    out["baseline"] = baseline
+    out = out.reset_index()
+    out["residual"] = out["log_sales"] - out["baseline"]
+    market = out.groupby(["retailer_nm", "period_id"])["residual"].transform("median")
+    out["residual"] = out["residual"] - market  # remove shared retailer-week calendar effect
+    return out
+
+
+def _peer_correlation_matrix(pr_weekly_resid: pd.DataFrame, min_overlap: int = PEER_MIN_OVERLAP_WEEKS):
+    """PPG x PPG correlation of residuals, combined across retailers via
+    Fisher's z (correct way to average correlations -- naive averaging
+    understates estimates built on more observations). Returns (corr,
+    effective_n); effective_n feeds the significance test below."""
+    all_ppgs = sorted(pr_weekly_resid["rgm_ppg"].unique())
+    z_mats, n_mats = [], []
+    for _, g in pr_weekly_resid.groupby("retailer_nm"):
+        wide = g.pivot(index="period_id", columns="rgm_ppg", values="residual")
+        corr = wide.corr(min_periods=min_overlap).reindex(index=all_ppgs, columns=all_ppgs)
+        overlap = wide.notna().astype(int)
+        n_obs = overlap.T.dot(overlap).reindex(index=all_ppgs, columns=all_ppgs)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            z = np.arctanh(corr.values.clip(-0.999, 0.999))
+        z[n_obs.values < min_overlap] = np.nan
+        z_mats.append(z)
+        n_mats.append(n_obs.values.astype(float))
+    weights = np.where(np.isnan(np.stack(z_mats)), 0, np.stack(n_mats) - 3)
+    weights = np.clip(weights, 0, None)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        z_weighted = np.nansum(np.stack(z_mats) * weights, axis=0) / np.where(weights.sum(axis=0) == 0, np.nan, weights.sum(axis=0))
+    combined = np.tanh(z_weighted)
+    return (
+        pd.DataFrame(combined, index=all_ppgs, columns=all_ppgs),
+        pd.DataFrame(weights.sum(axis=0), index=all_ppgs, columns=all_ppgs),
+    )
+
+
+def _significant_pairs_mask(corr: pd.DataFrame, effective_n: pd.DataFrame, alpha: float = PEER_ALPHA) -> pd.DataFrame:
+    """Bonferroni-corrected: with n*(n-1)/2 pairs tested at once, alpha
+    gets divided by that count first -- a raw correlation threshold alone
+    would flag many spurious pairs by chance at this scale."""
+    n_pairs = (corr.shape[0] * (corr.shape[0] - 1)) // 2
+    if n_pairs == 0:
+        return pd.DataFrame(False, index=corr.index, columns=corr.columns)
+    alpha_corrected = alpha / n_pairs
+    df = np.clip(effective_n.values - 2, 1, None)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        t_stat = corr.values * np.sqrt(df / (1 - corr.values ** 2))
+    p = 2 * (1 - sstats.t.cdf(np.abs(t_stat), df=df))
+    return pd.DataFrame(p < alpha_corrected, index=corr.index, columns=corr.columns)
+
+
+def _peer_correlation(df: pd.DataFrame, brand: pd.Series) -> pd.Series:
+    """Each PPG's average significant correlation with same-BRAND peers.
+    Brand, not subcategory -- checked empirically, brand gives more spread
+    (std 0.37 vs 0.33) and is the conceptually tighter peer group (a
+    manufacturer's own line, not a whole subcategory full of competitors)."""
+    pr_weekly = build_retailer_weekly_panel(df)
+    resid = _residuals_by_retailer(pr_weekly)
+    corr, n_eff = _peer_correlation_matrix(resid)
+    mask = _significant_pairs_mask(corr, n_eff)
+    masked = corr.where(mask)
+    groups = brand.reindex(corr.index)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        z = np.arctanh(masked.values.clip(-0.999, 0.999))
+    out = pd.Series(index=corr.index, dtype=float, name="peer_correlation")
+    for i, ppg in enumerate(corr.index):
+        same_group = np.where((groups.values == groups.loc[ppg]) & (corr.index != ppg))[0]
+        vals = z[i, same_group]
+        valid = vals[~np.isnan(vals)]
+        out.loc[ppg] = np.tanh(valid.mean()) if len(valid) else np.nan
+    return out
+
+
 def _compute_features(weekly: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
     global_min, global_max = df["period_id"].min(), df["period_id"].max()
     grouped = weekly.groupby("rgm_ppg")
@@ -190,18 +274,34 @@ def _compute_features(weekly: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
     # median-fill + flag rather than drop rows; fall back to 0 if a whole column is NaN
     fillable = ["price_elasticity", "promo_effect_ctrl", "promo_lift", "momentum", "mat_growth", "seasonality_index"]
     for col in fillable:
-        feats[col + "_missing"] = feats[col].isna().astype(int)
+        #feats[col + "_missing"] = feats[col].isna().astype(int)
         feats[col] = feats[col].fillna(feats[col].median()).fillna(0)
 
     meta = (
         df.drop_duplicates("rgm_ppg")
         .set_index("rgm_ppg")[[
             "is_own_manufacturer", "subcategory_nm", "brand_nm",
-            "attribute_9", "attribute_1", "attribute_7", "product_unit_size",
+            "attribute_9", "attribute_1", "attribute_7",
         ]]
-        .rename(columns={"attribute_9": "price_tier", "attribute_1": "form", "attribute_7": "benefit_type", "product_unit_size": "pack_size"})
+        .rename(columns={"attribute_9": "price_tier", "attribute_1": "form", "attribute_7": "benefit_type"})
     )
-    return feats.join(meta)
+    feats = feats.join(meta)
+
+    # within-PPG interaction terms -- built on the same log/signed-log scale
+    # each parent gets before clustering, not raw values: raw promo_week_share
+    # * promo_lift came out 0.95 correlated with promo_lift alone (its huge
+    # outlier-driven variance swamps the bounded 0-1 factor)
+    feats["promo_intensity_effect"] = feats["promo_week_share"] * np.log1p(feats["promo_lift"])
+    feats["dist_trend"] = feats["avg_acv"] * (np.sign(feats["growth_rate"]) * np.log1p(np.abs(feats["growth_rate"])))
+
+    # peer_correlation: average residual-sales correlation with same-BRAND
+    # peers, using the same significance-tested correlation logic above --
+    # not a separate module, computed right here.
+    peer_corr = _peer_correlation(df, feats["brand_nm"])
+    feats["peer_correlation_missing"] = peer_corr.reindex(feats.index).isna().astype(int)
+    feats["peer_correlation"] = peer_corr.reindex(feats.index).fillna(peer_corr.median()).fillna(0)
+
+    return feats
 
 
 def build_ppg_features(df: pd.DataFrame) -> pd.DataFrame:
