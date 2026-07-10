@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# data - keep raw data out of git
+data/raw/
+
+# OS
+.DS_Store
