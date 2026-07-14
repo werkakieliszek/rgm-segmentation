@@ -4,8 +4,8 @@ __pycache__/
 .venv/
 venv/
 
-# data - keep raw data out of git
-data/raw/
+# data - keep data out of git
+data/
 
 # OS
 .DS_Store
