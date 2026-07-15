@@ -10,7 +10,7 @@ pip install -r requirements.txt
 
 ## Structure
 - `src/` — feature engineering, clustering, interaction, and anomaly-detection modules (with tests)
-- `notebooks/` — run in order: 02_features → 03_interactions → 04_clustering → 05_report
+- `notebooks/` — run in order from the file
 - `data/raw/` — input data (not tracked here)
 
 ## Run
